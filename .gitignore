@@ -1,0 +1,7 @@
+build/*
+!build/zephyr/
+build/zephyr/*
+!build/zephyr/zephyr.elf
+*.o
+*.hex
+*.bin
