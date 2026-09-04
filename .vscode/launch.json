@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Badge Debug (OpenOCD + ST-Link)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "openocd",
+            "serverpath": "/usr/bin/openocd",
+            "cwd": "${workspaceFolder}",
+            "toolchainPrefix": "arm-none-eabi",
+            "gdbPath": "gdb-multiarch",
+            "executable": "${workspaceFolder}/build/zephyr/zephyr.elf",
+            "configFiles": [
+                "/usr/share/openocd/scripts/interface/stlink.cfg",
+                "/usr/share/openocd/scripts/target/stm32wbx.cfg"
+            ],
+            "svdFile": "${workspaceFolder}/.vscode/STM32WB55_CM4.svd",
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "both",
+            "preLaunchCommands": [
+                "set substitute-path /workdir /home/roman/Projects/Badge/Zephyr_Badge"
+            ],
+            "substitutePath": [
+                {
+                    "from": "/workdir",
+                    "to": "/home/roman/Projects/Badge/Zephyr_Badge"
+                }
+            ]
+        }
+    ]
+}

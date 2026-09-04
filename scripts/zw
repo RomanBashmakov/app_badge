@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# zw — запуск west (и произвольных команд) в docker-образе zephyr-build
+# с монтированием текущего west-workspace.
+#
+# Использование (из любой папки внутри west-workspace):
+#   zw west build -b weact_stm32wb55_core .   # первичная сборка приложения
+#   zw west build                              # инкрементальная пересборка
+#   zw west build -p always .                  # пересборка с нуля
+#   zw --usb west flash                        # прошивка: проброс USB (ST-Link)
+#   zw bash                                    # интерактивная оболочка в контейнере
+#   zw west update                             # обновление модулей манифеста
+#
+# Образ и пользователь контейнера (uid 1000) соответствуют хостовому
+# пользователю roman (uid 1000), поэтому файлы сборки не меняют владельца.
+# Рабочий каталог внутри контейнера соответствует текущему каталогу хоста.
+
+set -euo pipefail
+
+IMAGE="${ZW_IMAGE:-zephyrprojectrtos/zephyr-build:latest}"
+
+# --- корень west-workspace (каталог с .west) ищем вверх от $PWD ---
+topdir="$PWD"
+while [ "$topdir" != "/" ] && [ ! -d "$topdir/.west" ]; do
+	topdir="$(dirname "$topdir")"
+done
+if [ ! -d "$topdir/.west" ]; then
+	echo "zw: .west не найден выше $PWD — запустите из west-workspace" >&2
+	exit 1
+fi
+
+# --- рабочий каталог внутри контейнера (соответствует $PWD) ---
+inner="/workdir${PWD#"$topdir"}"
+
+# --- опциональный проброс USB (ST-Link/J-Link) для west flash / RTT ---
+usb_args=()
+if [ "${1:-}" = "--usb" ]; then
+	usb_args=(--privileged -v /dev/bus/usb:/dev/bus/usb)
+	shift
+fi
+
+exec docker run --rm -it \
+	-v "$topdir":/workdir \
+	-w "$inner" \
+	"${usb_args[@]+"${usb_args[@]}"}" \
+	"$IMAGE" "$@"

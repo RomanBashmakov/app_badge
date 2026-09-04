@@ -1,0 +1,68 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/*
+ * Бейдж на WeAct Studio STM32WB55 Core Board.
+ *
+ * Кнопка sw0 (PH3) и светодиод led0 (PE4) уже определены в базовом DTS
+ * платы — здесь не описываются (см. button.c: DT_ALIAS(sw0)/DT_ALIAS(led0)).
+ *
+ * Назначение overlay:
+ *   - подключение LoRa-трансивера SX1272 на SPI1;
+ *   - отключение неиспользуемой периферии для снижения тока.
+ */
+
+/ {
+	aliases {
+		lora0 = &sx1272;	/* алиас для подсистемы LoRa */
+	};
+};
+
+/* ====================================================================== *
+ *  SX1272 LoRa трансивер на SPI1 (распиновка проверена в zephyr_tutorial) *
+ *                                                                         *
+ *  Назначение пинов платы WeAct STM32WB55 Core:                           *
+ *    SCK  = PA5   (spi1_sck_pa5)                                          *
+ *    MISO = PB4   (spi1_miso_pb4)                                         *
+ *    MOSI = PB5   (spi1_mosi_pb5)                                         *
+ *    CS   = PA4   (программный CS через cs-gpios)                         *
+ *                                                                         *
+ *    RESET = PB3  (SX1272: активный высокий, open-drain)                  *
+ *                                                                         *
+ *  DIO пины (прерывания трансивера):                                      *
+ *    DIO0 = PC13 (RxDone — основной источник пробуждения CPU1 из STOP2), *
+ *    DIO1 = PC14, DIO2 = PC15, DIO3 = PC0 (задел: CAD/Timeout).           *
+ * ====================================================================== */
+&spi1 {
+	pinctrl-0 = <&spi1_sck_pa5 &spi1_miso_pb4 &spi1_mosi_pb5>;
+	pinctrl-names = "default";
+	cs-gpios = <&gpioa 4 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	sx1272: sx1272@0 {
+		compatible = "semtech,sx1272";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		status = "okay";
+
+		/* SX1272: RESET активный высокий (open-drain) */
+		reset-gpios = <&gpiob 3 GPIO_ACTIVE_HIGH>;
+
+		/* DIO0..DIO3 */
+		dio-gpios = <&gpioc 13 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>,
+			    <&gpioc 14 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>,
+			    <&gpioc 15 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>,
+			    <&gpioc 0  (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
+
+		power-amplifier-output = "rfo";
+	};
+};
+
+/* ====================================================================== *
+ *  Отключение неиспользуемой периферии для снижения энергопотребления    *
+ *                                                                         *
+ *  Каждый активный узел в SoC dtsi тактируется и потребляет ток          *
+ *  даже в idle. SPI1 не трогаем — он нужен SX1272.                       *
+ * ====================================================================== */
+&i2c1   { status = "disabled"; };
+&usart1 { status = "disabled"; };
+&spi2   { status = "disabled"; };

@@ -1,0 +1,62 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Zephyr: configure (первичная сборка)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/zw west build -b weact_stm32wb55_core .",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Первая сборка: выбор платы weact_stm32wb55_core + приложение из текущего каталога. Выполняется в docker zephyr-build через scripts/zw."
+        },
+        {
+            "label": "Zephyr: build (инкрементально)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/zw west build",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "detail": "Инкрементальная пересборка (каталог build/ уже существует)"
+        },
+        {
+            "label": "Zephyr: pristine rebuild (с нуля)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/zw west build -p always .",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "detail": "Полная пересборка с очисткой (после смены платы/оверлеев/конфигурации)"
+        },
+        {
+            "label": "Zephyr: flash (ST-Link, docker + USB)",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/zw --usb west flash",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "detail": "Прошивка через west flash (runner openocd) с пробросом USB ST-Link в контейнер"
+        },
+        {
+            "label": "Remap compile_commands paths (Docker → Host)",
+            "type": "shell",
+            "command": "sed 's|/workdir|/home/roman/Projects/Badge/Zephyr_Badge|g' ${workspaceFolder}/build/compile_commands.json > ${workspaceFolder}/build/compile_commands.local.json",
+            "problemMatcher": [],
+            "detail": "Создаёт локальную версию compile_commands с путями хоста для IntelliSense. Запускать после каждой пересборки."
+        }
+    ]
+}
