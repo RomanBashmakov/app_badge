@@ -1,12 +1,16 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Бейдж: BLE + LoRa SX1272 + кнопка sw0 + светодиод led0.
+ * Бейдж: BLE + LoRa SX1272 + акселерометр LIS2DH12 + кнопка sw0 +
+ * светодиод led0.
  *
  * Архитектура (слияние coconut_vibe и zephyr_tutorial):
  *   - кнопка/LED: прерывание EXTI + антидребезг (button.c);
  *   - BLE: реклама + подключение, сон/пробуждение (ble.c);
+ *   - GATT-сервисы данных: телеметрия и конфигурация (gatt_badge.c);
  *   - LoRa: непрерывный приём 868 МГц, пакеты в callback (lora.c);
+ *   - акселерометр LIS2DH12 (i2c1): поток опроса X/Y/Z + температура
+ *     кристалла, телеметрия в GATT через callback (accel.c);
  *   - PM: CPU1 (M4) входит в STOP2 при idle.
  *
  * Энергосбережение:
@@ -23,8 +27,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#include "accel.h"
 #include "ble.h"
 #include "button.h"
+#include "gatt_badge.h"
 #include "lora.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
@@ -63,7 +69,7 @@ static void sleep_work_handler(struct k_work *work)
 
 	if (!is_sleeping) {
 		is_sleeping = true;
-		ble_sleep();
+		//ble_sleep();
 	}
 }
 
@@ -81,6 +87,22 @@ int main(void)
 
 	/* Регистрируем callback активности для сброса таймера сна. */
 	button_set_activity_callback(on_button_activity);
+
+	/* --- GATT-сервисы данных жетона (gatt_badge.c) ---
+	 * ДО ble_init(): settings-обработчик badge/cfg должен быть
+	 * зарегистрирован до settings_load() в bt_ready(); callback
+	 * телеметрии — до старта потока опроса акселерометра.
+	 */
+	ret = gatt_badge_init();
+	if (ret < 0) {
+		LOG_ERR("Инициализация GATT-сервисов не удалась: %d", ret);
+	}
+
+	/* --- Акселерометр LIS2DH12 (i2c1): поток телеметрии --- */
+	ret = accel_init();
+	if (ret < 0) {
+		LOG_ERR("Инициализация акселерометра не удалась: %d", ret);
+	}
 
 	/* --- LoRa SX1272: приёмник 868 МГц --- */
 	ret = lora_init();
