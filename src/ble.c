@@ -20,6 +20,7 @@
 #include <zephyr/settings/settings.h>
 
 #include "ble.h"
+#include "event_log.h"
 #include "gatt_badge.h"
 
 LOG_MODULE_REGISTER(ble, CONFIG_LOG_DEFAULT_LEVEL);
@@ -107,6 +108,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	default_conn = bt_conn_ref(conn);
 
+	/* Событие в журнал (очередь + system workqueue — безопасно
+	 * из RX-потока HCI). */
+	event_log_write(EV_BLE_CONN, 0);
+
 	/* Запрос шифрования ВЫКЛЮЧЕН (временно). Свежее спаривание с телефоном
 	 * стабильно падает на этапе шифрования после раздачи ключей
 	 * (телефон: "Encryption failed (1)" + удаление бонда; жетон:
@@ -125,6 +130,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_INF("Bluetooth отключён, причина 0x%02x %s",
 		reason, bt_hci_err_to_str(reason));
+
+	event_log_write(EV_BLE_DISC, reason);
 
 	if (default_conn == conn) {
 		bt_conn_unref(default_conn);

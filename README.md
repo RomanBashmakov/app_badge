@@ -60,6 +60,11 @@
 | LIS2DH12 `AD` (SA0) | → 3V3 | I2C-адрес **0x19** (на GND → 0x18) |
 | LIS2DH12 `CS` | → 3V3 | CS=1: выбран I2C-режим чипа |
 | LIS2DH12 `IT1` (INT1) | PB0 | задел: триггеры (этап 2) |
+| W25Q32 `SLK` (CLK) | PA5 | `spi1_sck_pa5` — шина общая с SX1272 |
+| W25Q32 `D1` (DI/MOSI) | PB5 | `spi1_mosi_pb5` — общий |
+| W25Q32 `D0` (DO/MISO) | PB4 | `spi1_miso_pb4` — общий |
+| W25Q32 `CS` | PB6 | cs-gpios индекс 1 (индекс 0 = PA4 — SX1272) |
+| W25Q32 `VCC`/`GND` | 3V3/GND | JEDEC ID = 000000/FFFFFF → поменять D0/D1 |
 
 Узлы в `app.overlay`: `&spi1 → sx1272` (`compatible = "semtech,sx1272"`,
 alias `lora0`) и `&i2c1 → lis2dh12` (`compatible = "st,lis2dh12",
@@ -122,6 +127,41 @@ alias `lora0`) и `&i2c1 → lis2dh12` (`compatible = "st,lis2dh12",
 с `anym-on-int1`) — задел под пробуждение бейджа от тряски. Поллинг
 1 Гц будит CPU1 каждую секунду; на триггерах CPU будет спать до события.
 
+## Внешняя память W25Q32 (журнал событий, логи, данные)
+
+Модуль 4 МБ на **общем SPI1 с SX1272** (второй CS — PB6), штатный
+драйвер `jedec,spi-nor`. Разметка — `app.overlay`, узел `&w25q32`:
+
+| Партиция | Смещение | Размер | Назначение |
+|---|---|---|---|
+| `journal` | 0x00000 | 128 КБ | кольцевой журнал событий (ТЗ 4.2), **FCB** |
+| `syslog` | 0x20000 | 64 КБ | системный лог: `LOG_BACKEND_FS` + littlefs `/syslog` |
+| `userdata` | 0x30000 | 512 КБ | пользовательские данные (ТЗ 4.3): littlefs `/data` + AES-256-GCM |
+| `ext-reserve` | 0xB0000 | ~3.34 МБ | резерв (расширенный журнал, бэкапы — будущее) |
+
+- **Журнал событий** (`src/event_log.c`): записи 10 Б — `ts` (UNIX из
+  RTC) + `type` + `data` + CRC8; кольцевая ротация секторов
+  (амортизация износа) и восстановление после сбоя питания — штатные
+  для FCB. `event_log_write()` безопасна из любого контекста (очередь
+  + system workqueue). Сейчас пишутся: загрузка, кнопка, LoRa RX,
+  BLE connect/disconnect, запись юзерданных.
+- **Системный лог**: все `LOG_*` дублируются файлами `log.NNNN` в
+  `/syslog` (6 файлов × 8 КБ ≈ 49 КБ, при заполнении удаляется
+  старейший — OVERWRITE; 8 файлов в 64 КБ не помещаются вместе с
+  метаданными littlefs → ENOSPC). RTT — по-прежнему
+  основной канал отладки, флеш — персистентный дубль.
+- **Пользовательские данные** (`src/user_data.c`): блоки ТЗ 4.3 (кровь,
+  аллергии, хроника, форма 100 с дозаписью, аттестат) — цепочки
+  чанков-файлов по ≤4 КБ, AES-256-GCM через PSA Crypto; ключ
+  (32 Б RNG через `psa_generate_random` + `psa_import_key` — без
+  WANT_KEY_GENERATE) создаётся при первом старте и хранится в NVS
+  (`sec/aeskey`). Модель угроз и выбор стека:
+  `Badge_Obsidian/Работа/Криптозащита пользовательских данных.md`.
+- **Shell на RTT** (Channel 0): `journal dump [N]`, `journal clear`,
+  `fs ls /syslog`, `fs read /syslog/log.0000`, `udtest`
+  (FCT-тест 6: write/read тест-паттерна юзерданных с AES-GCM
+  roundtrip), …
+
 ## Структура проекта
 
 ```
@@ -137,7 +177,9 @@ alias `lora0`) и `&i2c1 → lis2dh12` (`compatible = "st,lis2dh12",
     ├── ble.c / ble.h  — BLE: реклама, подключение, сон/пробуждение
     ├── gatt_badge.c / gatt_badge.h — GATT-сервисы: ESS, BAD6E001, конфиг в NVS
     ├── button.c/.h    — кнопка sw0 + led0 (EXTI + антидребезг)
-    └── lora.c / lora.h — SX1272: конфиг модема, диагностика, приём
+    ├── event_log.c / event_log.h — журнал событий (ТЗ 4.2): FCB на внешней FLASH + shell
+    ├── lora.c / lora.h — SX1272: конфиг модема, диагностика, приём
+    └── user_data.c / user_data.h — пользовательские данные (ТЗ 4.3): /data, AES-256-GCM (PSA)
 ```
 
 ## Сборка и прошивка (MCUboot + приложение)

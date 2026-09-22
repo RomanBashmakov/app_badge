@@ -11,6 +11,9 @@
  *   - LoRa: непрерывный приём 868 МГц, пакеты в callback (lora.c);
  *   - акселерометр LIS2DH12 (i2c1): поток опроса X/Y/Z + температура
  *     кристалла, телеметрия в GATT через callback (accel.c);
+ *   - внешняя FLASH W25Q32 (spi1, общий с LoRa): журнал событий по
+ *     ТЗ 4.2 (event_log.c), системный лог (LOG_BACKEND_FS) и
+ *     шифрованные пользовательские данные по ТЗ 4.3 (user_data.c);
  *   - PM: CPU1 (M4) входит в STOP2 при idle.
  *
  * Энергосбережение:
@@ -30,8 +33,10 @@
 #include "accel.h"
 #include "ble.h"
 #include "button.h"
+#include "event_log.h"
 #include "gatt_badge.h"
 #include "lora.h"
+#include "user_data.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -87,6 +92,27 @@ int main(void)
 
 	/* Регистрируем callback активности для сброса таймера сна. */
 	button_set_activity_callback(on_button_activity);
+
+	/* --- Внешняя FLASH W25Q32: журнал + логи + данные (ТЗ 4.1–4.3) ---
+	 *
+	 * Журнал инициализируем до остальных модулей и первым же пишем
+	 * событие "boot". Данные — до BLE: ключ грузится из NVS тем же
+	 * settings-стеком (BT вызовет settings_load() повторно, это
+	 * штатно). Системный лог во флеш и маунты littlefs стартуют
+	 * автоматически (fstab automount + LOG_BACKEND_FS).
+	 */
+	ret = event_log_init();
+	if (ret < 0) {
+		LOG_ERR("Инициализация журнала событий не удалась: %d", ret);
+	}
+
+	ret = user_data_init();
+	if (ret < 0) {
+		LOG_ERR("Инициализация пользовательских данных не удалась: %d",
+			ret);
+	}
+
+	event_log_write(EV_BOOT, 0);
 
 	/* --- GATT-сервисы данных жетона (gatt_badge.c) ---
 	 * ДО ble_init(): settings-обработчик badge/cfg должен быть
