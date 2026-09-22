@@ -15,13 +15,19 @@
  * event_log_write() безопасна из любого контекста (в т.ч. из ISR:
  * событие ставится в очередь и пишется из system workqueue).
  *
- * Чтение: shell-команда «journal dump [N]» / «journal clear» (RTT).
+ * Чтение: shell «journal dump [N]» / «journal clear» (RTT) и по BLE —
+ * характеристика BAD6E004 (gatt_badge.c): дамп чанками + живой хвост.
  */
 
 #ifndef EVENT_LOG_H
 #define EVENT_LOG_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+/* Длина записи журнала, байт (ts LE32 | type | data LE32 | CRC8). */
+#define EV_LOG_RECORD_LEN 10u
 
 /* Классификатор событий ТЗ 4.2: категории 0x01–0x36.
  *
@@ -60,5 +66,39 @@ void event_log_write(uint8_t type, uint32_t data);
  * фолбэк на uptime. Синхронизации времени пока нет: значения
  * монотонны от старта питания, календарно фиктивны до установки. */
 uint32_t event_log_timestamp(void);
+
+/* ------------------------------------------------------------------ *
+ *  Чтение по BLE (BAD6E004, см. gatt_badge.c)                           *
+ * ------------------------------------------------------------------ */
+
+/* Прочитать записи [start, start+*out_count) в out (сырые 10-Б записи,
+ * от старейшей к новой; индексное пространство — валидные записи,
+ * повреждённые CRC пропускаются, как в shell dump).
+ *
+ *   out_size      — ёмкость out в байтах (кратна EV_LOG_RECORD_LEN;
+ *                   чанк ограничен ещё и MTU на стороне gatt_badge);
+ *   *out_count    — сколько записей положено (0, если start >= total);
+ *   *out_more     — true, если за концом чанка есть ещё записи;
+ *   *out_total    — всего валидных записей в журнале (мониторится
+ *                   клиентом: уменьшение = ротация, индексы сместились).
+ *
+ * Потокобезопасно: FCB сериализуется мьютексом с записью/очисткой.
+ * Возвращает 0 или -errno (-ENODEV до event_log_init()).
+ */
+int event_log_read_chunk(uint32_t start, uint8_t *out, size_t out_size,
+			 uint8_t *out_count, bool *out_more,
+			 uint32_t *out_total);
+
+/* Стереть журнал (fcb_clear). Используется shell «journal clear» и
+ * командой очистки по BLE. Возвращает 0 или -errno. */
+int event_log_clear(void);
+
+/* Колбэк «живого хвоста»: вызывается из system workqueue после каждой
+ * успешной записи события с сырыми 10 байтами записи. Регистрирует
+ * gatt_badge_init() — отправка BAD6E004 notify подписанному клиенту.
+ * Вызов лёгкий: не блокировать (bt_gatt_notify не блокирует). */
+typedef void (*event_log_live_cb_t)(const uint8_t rec[EV_LOG_RECORD_LEN]);
+
+void event_log_set_live_cb(event_log_live_cb_t cb);
 
 #endif /* EVENT_LOG_H */

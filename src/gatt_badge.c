@@ -23,6 +23,7 @@
 #include <zephyr/settings/settings.h>
 
 #include "accel.h"
+#include "event_log.h"
 #include "gatt_badge.h"
 
 LOG_MODULE_REGISTER(gatt_badge, CONFIG_LOG_DEFAULT_LEVEL);
@@ -279,6 +280,7 @@ BT_GATT_SERVICE_DEFINE(ess_svc,
 #define BADGE_SVC_UUID   BADGE_UUID_BASE_LE, 0x01, 0xe0, 0xd6, 0xba
 #define BADGE_ACCEL_UUID BADGE_UUID_BASE_LE, 0x02, 0xe0, 0xd6, 0xba
 #define BADGE_CFG_UUID   BADGE_UUID_BASE_LE, 0x03, 0xe0, 0xd6, 0xba
+#define BADGE_JOURNAL_UUID BADGE_UUID_BASE_LE, 0x04, 0xe0, 0xd6, 0xba
 
 static ssize_t read_accel(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			  void *buf, uint16_t len, uint16_t offset)
@@ -366,6 +368,138 @@ static ssize_t write_cfg(struct bt_conn *conn, const struct bt_gatt_attr *attr,
  * [0]=primary, [1]=declaration, [2]=значение характеристики. */
 #define ACCEL_VAL_ATTR (&badge_svc.attrs[2])
 #define TEMP_VAL_ATTR  (&ess_svc.attrs[2])
+/* BAD6E004 в badge_svc после конфигурационной: [4]=decl cfg, [5]=cfg,
+ * [6]=decl journal, [7]=значение journal. */
+#define JOURNAL_VAL_ATTR (&badge_svc.attrs[7])
+
+/* ------------------------------------------------------------------ *
+ *  Журнал событий по BLE (BAD6E004, фаза 2)                             *
+ *                                                                     *
+ *  Write-запрос, 5 Б: [op u8][arg u32 LE]                              *
+ *    op 0x01 — дамп журнала с записи №arg (0 = с старейшей)            *
+ *    op 0x02 — очистить журнал                                         *
+ *  Notify-ответы (только подписанным на BAD6E004):                     *
+ *    op 0x01 чанк: [op][total u32][count u8][more u8][count×10 Б]      *
+ *                  — записи ровно с запрошенного arg; count адаптивен  *
+ *                  к MTU клиента (1 запись при MTU 23, 23 при 247);    *
+ *                  more=1 → клиент запрашивает следующий чанк          *
+ *    op 0x02 очистка завершена: [op][total u32 = 0]                    *
+ *    op 0x03 живой хвост: [op][10 Б записи] — каждое новое событие     *
+ *  total в каждом чанке: уменьшился = ротация журнала стёрла старейшие *
+ *  секторы, индексы сместились → клиент перезапускает дамп с 0.        *
+ * ------------------------------------------------------------------ */
+
+#define JR_OP_DUMP_REQ    0x01
+#define JR_OP_CLEAR_REQ   0x02
+#define JR_OP_CHUNK       0x01
+#define JR_OP_CLEARED     0x02
+#define JR_OP_LIVE        0x03
+#define JR_REQ_LEN        5	/* op u8 + arg u32 */
+
+/* Чанк: [op][total u32][count u8][more u8] + записи по 10 Б.
+ * Записей при ATT MTU 247: (247-3-7)/10 = 23. */
+#define JR_CHUNK_HDR_LEN  7
+#define JR_MAX_COUNT      23
+
+static uint8_t jr_tx[JR_CHUNK_HDR_LEN + JR_MAX_COUNT * EV_LOG_RECORD_LEN];
+/* Отдельный буфер live-пакета: журнал-чанк собирается тем же system
+ * workqueue'ом (jr_work), но живой хвост уходит из flush_work —
+ * workqueue один, вызовы сериализованы; отдельный буфер — от греха. */
+static uint8_t jr_live[1 + EV_LOG_RECORD_LEN];
+
+struct jr_request {
+	uint8_t op;
+	uint32_t arg;
+	uint16_t mtu;		/* ATT MTU клиента на момент запроса */
+};
+
+static struct jr_request jr_req;
+static struct k_work jr_work;
+
+/* ATT MTU текущего соединения (у жетона оно одно). Прямой геттера
+ * (bt_gatt_get_att_mtu) в этом дереве Zephyr нет — трекаем exchange
+ * через bt_gatt_cb.att_mtu_updated; до обмена действует дефолт 23
+ * (чанк = 1 запись), после 247 — 23 записи. */
+static atomic_t att_mtu_val = ATOMIC_INIT(23);
+
+static void journal_att_mtu_updated(struct bt_conn *conn, uint16_t tx,
+				    uint16_t rx)
+{
+	ARG_UNUSED(conn);
+
+	uint16_t eff = MIN(tx, rx);
+
+	atomic_set(&att_mtu_val, (atomic_val_t)eff);
+	LOG_INF("ATT MTU: %u", eff);
+}
+
+/* non-const: bt_gatt_cb_register() вешает структуру в свой список
+ * (мутит поле node) — API требует именно struct bt_gatt_cb *. */
+static struct bt_gatt_cb journal_gatt_cb = {
+	.att_mtu_updated = journal_att_mtu_updated,
+};
+
+static void journal_ccc_changed(const struct bt_gatt_attr *attr,
+				uint16_t value)
+{
+	ARG_UNUSED(attr);
+
+	LOG_INF("Подписка BAD6E004 (журнал): %s",
+		(value & BT_GATT_CCC_NOTIFY) ? "вкл" : "выкл");
+}
+
+static void journal_notify(const struct bt_gatt_attr *attr,
+			   const void *data, uint16_t len)
+{
+	if (!atomic_get(&bt_ready_flag)) {
+		return;
+	}
+
+	int err = bt_gatt_notify(NULL, attr, data, len);
+
+	if (err && err != -ENOTCONN) {
+		LOG_WRN("notify BAD6E004 не удался: %d", err);
+	}
+}
+
+/* journal_work_handler и journal_live_cb — ниже, ПОСЛЕ
+ * BT_GATT_SERVICE_DEFINE(badge_svc): используют JOURNAL_VAL_ATTR. */
+
+static ssize_t write_journal(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr,
+			     const void *buf, uint16_t len, uint16_t offset,
+			     uint8_t flags)
+{
+	const uint8_t *raw = buf;
+
+	ARG_UNUSED(attr);
+	ARG_UNUSED(conn);
+
+	if (flags & BT_GATT_WRITE_FLAG_PREPARE) {
+		return BT_GATT_ERR(EINVAL);
+	}
+
+	if (offset != 0 || len != JR_REQ_LEN) {
+		LOG_WRN("write BAD6E004: offset=%u len=%u (ожидалось 0/%u)",
+			offset, len, JR_REQ_LEN);
+		return BT_GATT_ERR(EINVAL);
+	}
+
+	uint8_t op = raw[0];
+	uint32_t arg = sys_get_le32(&raw[1]);
+
+	if (op != JR_OP_DUMP_REQ && op != JR_OP_CLEAR_REQ) {
+		LOG_WRN("write BAD6E004: неизвестный op 0x%02x", op);
+		return BT_GATT_ERR(EINVAL);
+	}
+
+	jr_req.op = op;
+	jr_req.arg = arg;
+	jr_req.mtu = (uint16_t)atomic_get(&att_mtu_val);
+
+	k_work_submit(&jr_work);
+	return len;
+}
 
 BT_GATT_SERVICE_DEFINE(badge_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(BADGE_SVC_UUID)),
@@ -378,7 +512,70 @@ BT_GATT_SERVICE_DEFINE(badge_svc,
 		BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 		BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
 		read_cfg, write_cfg, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(BADGE_JOURNAL_UUID),
+		BT_GATT_CHRC_WRITE | BT_GATT_CHRC_NOTIFY,
+		BT_GATT_PERM_WRITE,
+		NULL, write_journal, NULL),
+	BT_GATT_CCC(journal_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
+
+/* ------------------------------------------------------------------ *
+ *  Обработчики BAD6E004 (после определения badge_svc: используют       *
+ *  JOURNAL_VAL_ATTR).                                                  *
+ * ------------------------------------------------------------------ */
+
+/* Дамп/очистка по запросу — в system workqueue: walk FCB читает флеш
+ * (десятки мс на полном журнале), BT RX-поток на это время не вешаем. */
+static void journal_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (jr_req.op == JR_OP_CLEAR_REQ) {
+		int rc = event_log_clear();
+
+		if (rc != 0) {
+			LOG_WRN("Очистка журнала по BLE: %d", rc);
+		}
+
+		jr_tx[0] = JR_OP_CLEARED;
+		sys_put_le32(0, &jr_tx[1]);
+		journal_notify(JOURNAL_VAL_ATTR, jr_tx, 5);
+		return;
+	}
+
+	/* JR_OP_DUMP_REQ: ограничить чанк MTU запросившего клиента. */
+	uint32_t room = (uint32_t)jr_req.mtu > 3 ? (jr_req.mtu - 3) : 20;
+	uint32_t max_cnt = MIN((room - JR_CHUNK_HDR_LEN) / EV_LOG_RECORD_LEN,
+			       JR_MAX_COUNT);
+	uint8_t count = 0;
+	bool more = false;
+	uint32_t total = 0;
+	size_t out_size = max_cnt * EV_LOG_RECORD_LEN;
+	int rc = event_log_read_chunk(jr_req.arg, jr_tx + JR_CHUNK_HDR_LEN,
+				      out_size, &count, &more, &total);
+
+	if (rc != 0) {
+		LOG_WRN("Чанк журнала по BLE (с %u): %d", jr_req.arg, rc);
+		total = 0;
+	}
+
+	jr_tx[0] = JR_OP_CHUNK;
+	sys_put_le32(total, &jr_tx[1]);
+	jr_tx[5] = count;
+	jr_tx[6] = more ? 1 : 0;
+
+	journal_notify(JOURNAL_VAL_ATTR, jr_tx,
+		       JR_CHUNK_HDR_LEN + count * EV_LOG_RECORD_LEN);
+}
+
+/* Живой хвост: регистрируется в gatt_badge_init(), вызывается из
+ * flush_work (system workqueue) после каждой записи события. */
+static void journal_live_cb(const uint8_t rec[EV_LOG_RECORD_LEN])
+{
+	jr_live[0] = JR_OP_LIVE;
+	memcpy(&jr_live[1], rec, EV_LOG_RECORD_LEN);
+	journal_notify(JOURNAL_VAL_ATTR, jr_live, sizeof(jr_live));
+}
 
 /* ------------------------------------------------------------------ *
  *  Публикация телеметрии (вызывается из потока опроса accel.c)         *
@@ -456,8 +653,15 @@ int gatt_badge_init(void)
 	 * потока опроса), чтобы не терять замеры и не гоняться за ними. */
 	accel_set_telemetry_cb(on_accel_telemetry);
 
+	k_work_init(&jr_work, journal_work_handler);
+	bt_gatt_cb_register(&journal_gatt_cb);
+
+	/* Живой хвост журнала в BAD6E004 (см. event_log.c flush_work). */
+	event_log_set_live_cb(journal_live_cb);
+
 	LOG_INF("GATT-сервисы жетона готовы: ESS 0x181A + BAD6E001 "
-		"(аксель BAD6E002, конфиг BAD6E003, NVS %s)", BADGE_CFG_KEY);
+		"(аксель BAD6E002, конфиг BAD6E003, журнал BAD6E004, "
+		"NVS %s)", BADGE_CFG_KEY);
 	return 0;
 }
 

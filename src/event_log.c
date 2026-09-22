@@ -35,7 +35,7 @@ LOG_MODULE_REGISTER(event_log, CONFIG_LOG_DEFAULT_LEVEL);
 
 /* Запись ТЗ 4.2: ровно 10 байт. Сериализуем вручную (LE), packed-структура
  * не нужна и не используется — не зависим от раскладки компилятора. */
-#define RECORD_LEN		10
+#define RECORD_LEN		EV_LOG_RECORD_LEN
 #define RECORD_CRC_POLY		0x07	/* CRC-8-CCITT */
 #define RECORD_CRC_INIT		0x00
 
@@ -51,6 +51,15 @@ static struct fcb journal_fcb = {
 };
 
 static bool journal_ready;
+
+/* Сериализация доступа к FCB: append идёт из system workqueue, чтение
+ * чанков (event_log_read_chunk) — тоже из system workqueue по запросу
+ * GATT, очистка — из shell/BT-потока. Walk чанка под мьютексом —
+ * миллисекунды; записи на это время копятся в msgq (16 глубокая). */
+static K_MUTEX_DEFINE(journal_lock);
+
+/* «Живой хвост» для BLE (BAD6E004): вызывается после каждой записи. */
+static event_log_live_cb_t live_cb;
 
 /* ------------------------------------------------------------------ *
  *  Очередь событий: write может зваться из ISR (напр. LoRa DIO0) —     *
@@ -113,13 +122,19 @@ static bool record_crc_ok(const uint8_t raw[RECORD_LEN])
  *  Запись в FCB (вызывается только из system workqueue)                *
  * ------------------------------------------------------------------ */
 
-static int journal_append(uint32_t ts, uint8_t type, uint32_t data)
+static int journal_append(uint32_t ts, uint8_t type, uint32_t data,
+			  uint8_t raw_out[RECORD_LEN])
 {
 	uint8_t raw[RECORD_LEN];
 	struct fcb_entry loc;
 	int rc;
 
 	record_serialize(ts, type, data, raw);
+	if (raw_out != NULL) {
+		memcpy(raw_out, raw, RECORD_LEN);
+	}
+
+	k_mutex_lock(&journal_lock, K_FOREVER);
 
 	rc = fcb_append(&journal_fcb, RECORD_LEN, &loc);
 	if (rc == -ENOSPC) {
@@ -127,23 +142,27 @@ static int journal_append(uint32_t ts, uint8_t type, uint32_t data)
 		 * и повторяем. */
 		rc = fcb_rotate(&journal_fcb);
 		if (rc != 0) {
-			return rc;
+			goto out;
 		}
 		rc = fcb_append(&journal_fcb, RECORD_LEN, &loc);
 		if (rc != 0) {
-			return rc;
+			goto out;
 		}
 	} else if (rc != 0) {
-		return rc;
+		goto out;
 	}
 
 	rc = flash_area_write(journal_fcb.fap, FCB_ENTRY_FA_DATA_OFF(loc),
 			      raw, RECORD_LEN);
 	if (rc != 0) {
-		return rc;
+		goto out;
 	}
 
-	return fcb_append_finish(&journal_fcb, &loc);
+	rc = fcb_append_finish(&journal_fcb, &loc);
+
+out:
+	k_mutex_unlock(&journal_lock);
+	return rc;
 }
 
 static void journal_flush_handler(struct k_work *work)
@@ -153,12 +172,20 @@ static void journal_flush_handler(struct k_work *work)
 	ARG_UNUSED(work);
 
 	while (k_msgq_get(&evt_q, &ev, K_NO_WAIT) == 0) {
+		uint8_t raw[RECORD_LEN];
 		int rc = journal_append(event_log_timestamp(), ev.type,
-					ev.data);
+					ev.data, raw);
 
 		if (rc != 0) {
 			LOG_ERR("Запись события 0x%02x в журнал: %d",
 				ev.type, rc);
+			continue;
+		}
+
+		/* «Живой хвост» BLE: подписанному BAD6E004-клиенту
+		 * событие уходит сразу, не дожидаясь опроса. */
+		if (live_cb != NULL) {
+			live_cb(raw);
 		}
 	}
 
@@ -249,6 +276,107 @@ static int dump_walk_cb(struct fcb_entry_ctx *loc_ctx, void *arg)
 }
 
 /* ------------------------------------------------------------------ *
+ *  Чтение по BLE: чанк записей + очистка + живой хвост (BAD6E004)      *
+ * ------------------------------------------------------------------ */
+
+struct chunk_ctx {
+	uint32_t skip;		/* сколько валидных записей пропустить */
+	uint32_t want;		/* максимум записей в чанк */
+	uint8_t *out;		/* куда складывать сырые записи */
+	uint32_t filled;	/* положено записей */
+	uint32_t total;		/* всего валидных записей (весь журнал) */
+	uint32_t corrupt;	/* повреждено CRC (не входят в индексы) */
+};
+
+static int chunk_walk_cb(struct fcb_entry_ctx *loc_ctx, void *arg)
+{
+	struct chunk_ctx *ctx = arg;
+	uint8_t raw[RECORD_LEN];
+
+	if (flash_area_read(loc_ctx->fap, FCB_ENTRY_FA_DATA_OFF(loc_ctx->loc),
+			    raw, RECORD_LEN) != 0) {
+		ctx->corrupt++;
+		return 0;
+	}
+
+	if (!record_crc_ok(raw)) {
+		ctx->corrupt++;
+		return 0;
+	}
+
+	/* ctx->total — индекс текущей записи (только валидные, как в
+	 * dump): собираем [skip, skip+want), остальное только считаем. */
+	if (ctx->total >= ctx->skip && ctx->filled < ctx->want) {
+		memcpy(ctx->out + ctx->filled * RECORD_LEN, raw,
+		       RECORD_LEN);
+		ctx->filled++;
+	}
+	ctx->total++;
+	return 0;
+}
+
+int event_log_read_chunk(uint32_t start, uint8_t *out, size_t out_size,
+			 uint8_t *out_count, bool *out_more,
+			 uint32_t *out_total)
+{
+	struct chunk_ctx ctx;
+	uint32_t want;
+	int rc;
+
+	if (!journal_ready) {
+		return -ENODEV;
+	}
+	if (out == NULL || out_count == NULL || out_more == NULL ||
+	    out_total == NULL || out_size < RECORD_LEN) {
+		return -EINVAL;
+	}
+
+	want = MIN(out_size / RECORD_LEN, 0xFFu);
+	ctx.skip = start;
+	ctx.want = want;
+	ctx.out = out;
+	ctx.filled = 0;
+	ctx.total = 0;
+	ctx.corrupt = 0;
+
+	rc = k_mutex_lock(&journal_lock, K_FOREVER);
+	if (rc != 0) {
+		return rc;
+	}
+	rc = fcb_walk(&journal_fcb, NULL, chunk_walk_cb, &ctx);
+	k_mutex_unlock(&journal_lock);
+	if (rc != 0) {
+		LOG_ERR("fcb_walk (чанк с %u): %d", start, rc);
+		return rc;
+	}
+
+	*out_count = (uint8_t)ctx.filled;
+	*out_more = (start + ctx.filled) < ctx.total;
+	*out_total = ctx.total;
+	return 0;
+}
+
+int event_log_clear(void)
+{
+	int rc;
+
+	if (!journal_ready) {
+		return -ENODEV;
+	}
+
+	k_mutex_lock(&journal_lock, K_FOREVER);
+	rc = fcb_clear(&journal_fcb);
+	k_mutex_unlock(&journal_lock);
+
+	return rc;
+}
+
+void event_log_set_live_cb(event_log_live_cb_t cb)
+{
+	live_cb = cb;
+}
+
+/* ------------------------------------------------------------------ *
  *  Shell: journal dump [N] | journal clear                             *
  * ------------------------------------------------------------------ */
 
@@ -315,14 +443,9 @@ static int cmd_journal_clear(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
-	if (!journal_ready) {
-		shell_error(sh, "Журнал не инициализирован (FLASH?)");
-		return -ENODEV;
-	}
-
-	rc = fcb_clear(&journal_fcb);
+	rc = event_log_clear();
 	if (rc != 0) {
-		shell_error(sh, "fcb_clear: %d", rc);
+		shell_error(sh, "event_log_clear: %d", rc);
 		return rc;
 	}
 

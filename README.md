@@ -145,6 +145,13 @@ alias `lora0`) и `&i2c1 → lis2dh12` (`compatible = "st,lis2dh12",
   для FCB. `event_log_write()` безопасна из любого контекста (очередь
   + system workqueue). Сейчас пишутся: загрузка, кнопка, LoRa RX,
   BLE connect/disconnect, запись юзерданных.
+- **Журнал по BLE** (`BAD6E004` в `gatt_badge.c`, фаза 2): дамп
+  чанками pull-моделью (write-запрос → notify-чанк записей,
+  адаптивно к MTU), очистка с подтверждением, живой хвост новых
+  событий подписанному клиенту. Клиент — вкладка «Журнал» в
+  android_badge. Контракт — комментарии в `gatt_badge.c` и
+  `BadgeConfig.kt` (object `Journal`); FCB-доступ сериализован
+  мьютексом (`event_log_read_chunk`/`event_log_clear`).
 - **Системный лог**: все `LOG_*` дублируются файлами `log.NNNN` в
   `/syslog` (6 файлов × 8 КБ ≈ 49 КБ, при заполнении удаляется
   старейший — OVERWRITE; 8 файлов в 64 КБ не помещаются вместе с
