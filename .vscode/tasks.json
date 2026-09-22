@@ -32,7 +32,7 @@
         {
             "label": "Zephyr: pristine rebuild (с нуля)",
             "type": "shell",
-            "command": "${workspaceFolder}/scripts/zw west build -p always .",
+            "command": "${workspaceFolder}/scripts/zw west build -p always -b weact_stm32wb55_core .",
             "options": {
                 "cwd": "${workspaceFolder}"
             },

@@ -12,6 +12,7 @@
 #include <zephyr/logging/log.h>
 
 #include "button.h"
+#include "event_log.h"
 
 LOG_MODULE_REGISTER(button, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -60,6 +61,7 @@ static void button_debounce_handler(struct k_work *work)
 	if (val) {
 		gpio_pin_set_dt(&led, 1);
 		LOG_INF("[sw0] нажата");
+		event_log_write(EV_BUTTON, 1);
 		/* Уведомляем main() о активности для сброса таймера сна. */
 		if (activity_callback) {
 			activity_callback();
@@ -67,6 +69,7 @@ static void button_debounce_handler(struct k_work *work)
 	} else {
 		gpio_pin_set_dt(&led, 0);
 		LOG_INF("[sw0] отжата");
+		event_log_write(EV_BUTTON, 0);
 	}
 }
 

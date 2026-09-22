@@ -6,9 +6,13 @@ project(badge)
 
 target_sources(app PRIVATE
     src/main.c
+    src/accel.c
     src/ble.c
     src/button.c
-    src/lora.c)
+    src/event_log.c
+    src/gatt_badge.c
+    src/lora.c
+    src/user_data.c)
 
 # Доступ к низкоуровневому API модуля loramac-node (radio.h: struct Radio_s)
 # для прямого чтения/записи регистров SX1272 по SPI (диагностика в lora.c).

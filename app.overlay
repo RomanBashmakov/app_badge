@@ -8,12 +8,16 @@
  *
  * Назначение overlay:
  *   - подключение LoRa-трансивера SX1272 на SPI1;
+ *   - подключение внешней FLASH W25Q32 (4 МБ) на тот же SPI1 (второй CS);
+ *   - подключение акселерометра LIS2DH12 на I2C1;
  *   - отключение неиспользуемой периферии для снижения тока.
  */
 
 / {
 	aliases {
 		lora0 = &sx1272;	/* алиас для подсистемы LoRa */
+		accel0 = &lis2dh12;	/* алиас акселерометра (как на платах Zephyr) */
+		extflash0 = &w25q32;	/* внешняя SPI-NOR FLASH (журнал/логи/данные) */
 	};
 };
 
@@ -24,7 +28,7 @@
  *    SCK  = PA5   (spi1_sck_pa5)                                          *
  *    MISO = PB4   (spi1_miso_pb4)                                         *
  *    MOSI = PB5   (spi1_mosi_pb5)                                         *
- *    CS   = PA4   (программный CS через cs-gpios)                         *
+ *    CS   = PA4   (программный CS через cs-gpios, индекс 0)               *
  *                                                                         *
  *    RESET = PB3  (SX1272: активный высокий, open-drain)                  *
  *                                                                         *
@@ -35,7 +39,10 @@
 &spi1 {
 	pinctrl-0 = <&spi1_sck_pa5 &spi1_miso_pb4 &spi1_mosi_pb5>;
 	pinctrl-names = "default";
-	cs-gpios = <&gpioa 4 GPIO_ACTIVE_LOW>;
+	/* Два программных CS на шине: индекс 0 — SX1272 (PA4), 1 — W25Q32 (PB6).
+	 * Zephyr SPI-транзакции лочат шину на устройство, так что совместное
+	 * использование SPI1 трансивером и флешей штатно. */
+	cs-gpios = <&gpioa 4 GPIO_ACTIVE_LOW>, <&gpiob 6 GPIO_ACTIVE_LOW>;
 	status = "okay";
 
 	sx1272: sx1272@0 {
@@ -55,14 +62,138 @@
 
 		power-amplifier-output = "rfo";
 	};
+
+	/* ================================================================== *
+	 *  Внешняя FLASH W25Q32BVSIG (Winbond, 4 МБ) — ТЗ 4.1               *
+	 *                                                                     *
+	 *  Модуль (6 пин): VCC→3V3, GND→GND, SLK(CLK)→PA5,                  *
+	 *  D1(DI/MOSI)→PB5, D0(DO/MISO)→PB4 — шина общая с SX1272;          *
+	 *  CS→PB6 (cs-gpios, индекс 1). Если JEDEC ID читается как          *
+	 *  000000/FFFFFF — у модуля D0/D1 перепутаны местами, поменять      *
+	 *  два провода.                                                       *
+	 *                                                                     *
+	 *  Драйвер: штатный drivers/flash/spi_nor.c (compatible              *
+	 *  "jedec,spi-nor", CONFIG_SPI_NOR). JEDEC ID W25Q32BV = ef 40 16.  *
+	 *  8 МГц — надёжно на проводах-перемычках (чип держит до 104 МГц).   *
+	 *                                                                     *
+	 *  Разметка 4 МБ (ТЗ 4.1): журнал 128К · системный лог 64К ·         *
+	 *  пользовательские данные 512К · резерв 3.34М. Резерв потом можно   *
+	 *  отдать под любую партицию, не трогая чужие смещения.              *
+	 * ================================================================== */
+	w25q32: w25q32@1 {
+		compatible = "jedec,spi-nor";
+		reg = <1>;
+		spi-max-frequency = <8000000>;
+		jedec-id = [ef 40 16];
+		size = <33554432>;	/* 4 МБ */
+		status = "okay";
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/* Кольцевый журнал событий (ТЗ 4.2), FCB: 32 сектора × 4 КБ */
+			journal_partition: partition@0 {
+				label = "journal";
+				reg = <0x00000000 0x00020000>;	/* 128 КБ */
+			};
+
+			/* Системный лог (CONFIG_LOG_BACKEND_FS), littlefs */
+			syslog_partition: partition@20000 {
+				label = "syslog";
+				reg = <0x00020000 0x00010000>;	/* 64 КБ */
+			};
+
+			/* Пользовательские данные (ТЗ 4.3), littlefs + AES-GCM */
+			userdata_partition: partition@30000 {
+				label = "userdata";
+				reg = <0x00030000 0x00080000>;	/* 512 КБ */
+			};
+
+			/* Резерв: расширенный журнал, бэкапы, ключи (будущее) */
+			reserve_partition: partition@b0000 {
+				label = "ext-reserve";
+				reg = <0x000b0000 0x00350000>;	/* ~3.34 МБ */
+			};
+		};
+	};
+};
+
+/* ====================================================================== *
+ *  Акселерометр LIS2DH12 на I2C1 (модуль RobotClass «LIS2DH12 с QIIC»)   *
+ *                                                                         *
+ *  Шина уже настроена в базовом DTS платы WeAct (PB8=SCL, PB9=SDA,        *
+ *  400 кГц; подтяжки SCL/SDA — на самом модуле). Выбор адреса и режима:   *
+ *    AD (SA0) = 3V3 → I2C-адрес 0x19 (надпись на модуле; на GND → 0x18);  *
+ *    CS       = 3V3 → I2C-режим чипа (CS=0 включил бы SPI-режим).        *
+ *                                                                         *
+ *  compatible: "st,lis2dh12" (биндинг st,lis2dh12-i2c.yaml) + базовый    *
+ *  "st,lis2dh" — по нему драйвер drivers/sensor/st/lis2dh находит узел   *
+ *  (DT_DRV_COMPAT st_lis2dh). Так же подключён LIS2DH12 на платах        *
+ *  Zephyr (actinius_icarus, decawave_dwm1001_dev и др.).                 *
+ *                                                                         *
+ *  INT1 чипа (IT1 на модуле) — на PB0: задел под этап 2                  *
+ *  (CONFIG_LIS2DH_TRIGGER_*: data-ready / детектор движения).            *
+ *  На этапе 1 (поллинг) пин лишь настраивается входом.                   *
+ *  INT2 (IT2) не подключён.                                              *
+ * ====================================================================== */
+&i2c1 {
+	lis2dh12: lis2dh12@19 {
+		compatible = "st,lis2dh12", "st,lis2dh";
+		reg = <0x19>;
+		status = "okay";
+
+		/* INT1 (IT1) → PB0, активен высоким уровнем. */
+		irq-gpios = <&gpiob 0 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* ====================================================================== *
+ *  Файловые системы на партициях W25Q32 (fstab, автомаунты)              *
+ *                                                                         *
+ *  /syslog — системный лог (CONFIG_LOG_BACKEND_FS, ТЗ 4.1 ≤64 КБ);       *
+ *  /data   — пользовательские данные (ТЗ 4.3, шифруются AES-GCM).        *
+ *  Кэш 64 Б у syslog (только запись логов); 256 Б у /data (чтение        *
+ *  сканером/по BLE позже). automount: формат при первом маунте           *
+ *  littlefs делает сам (флаг FS_MOUNT_FLAG_AUTOMATIC + форматирование).  *
+ * ====================================================================== */
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+
+		lfs_syslog: lfs_syslog {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/syslog";
+			partition = <&syslog_partition>;
+			automount;
+			read-size = <16>;
+			prog-size = <16>;
+			cache-size = <64>;
+			lookahead-size = <32>;
+			block-cycles = <512>;
+		};
+
+		lfs_data: lfs_data {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/data";
+			partition = <&userdata_partition>;
+			automount;
+			read-size = <16>;
+			prog-size = <16>;
+			cache-size = <256>;
+			lookahead-size = <64>;
+			block-cycles = <512>;
+		};
+	};
 };
 
 /* ====================================================================== *
  *  Отключение неиспользуемой периферии для снижения энергопотребления    *
  *                                                                         *
  *  Каждый активный узел в SoC dtsi тактируется и потребляет ток          *
- *  даже в idle. SPI1 не трогаем — он нужен SX1272.                       *
+ *  даже в idle. SPI1 не трогаем — он нужен SX1272 и W25Q32;              *
+ *  I2C1 — LIS2DH12.                                                      *
  * ====================================================================== */
-&i2c1   { status = "disabled"; };
 &usart1 { status = "disabled"; };
 &spi2   { status = "disabled"; };

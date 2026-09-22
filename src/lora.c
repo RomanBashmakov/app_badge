@@ -26,6 +26,8 @@
  */
 #include <radio.h>
 
+#include "event_log.h"
+
 /* Адреса регистров SX1272 (LoRa-режим).
  * Источник: modules/lib/loramac-node/src/radio/sx1272/sx1272Regs-LoRa.h
  */
@@ -63,6 +65,9 @@ static void on_lora_packet_recv(const struct device *dev, uint8_t *data,
 
 	LOG_INF("LoRa RX: RSSI=%d dBm, SNR=%d dB, %u байт", rssi, snr, size);
 	LOG_HEXDUMP_INF(data, size, "payload");
+
+	/* В журнал событий (очередь + system workqueue — безопасно из ISR). */
+	event_log_write(EV_LORA_RX, size);
 }
 
 /* ------------------------------------------------------------------ *

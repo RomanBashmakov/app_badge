@@ -20,6 +20,8 @@
 #include <zephyr/settings/settings.h>
 
 #include "ble.h"
+#include "event_log.h"
+#include "gatt_badge.h"
 
 LOG_MODULE_REGISTER(ble, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -43,10 +45,17 @@ static bool is_sleeping;
 			BT_GAP_ADV_SLOW_INT_MAX, \
 			NULL)
 
-/* Advertising data: флаги LE. */
+/* Advertising data: флаги LE + 128-битный UUID сервиса BAD6E001
+ * (приложение фильтрует рекламу по имени «Badge» или по этому UUID;
+ * оба UUID BAD6E001+SMP в один adv-пакет не влезают — 39 > 31 байт).
+ * Байты 128-битного UUID в рекламе — little-endian (хвост — как в
+ * gatt_badge.c: cd ab 89 67 45 23 01 ef). */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS,
 		      (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
+		      0x89, 0x67, 0x45, 0x23, 0x01, 0xef, 0xcd, 0xab,
+		      0x78, 0x56, 0x34, 0x12, 0x01, 0xe0, 0xd6, 0xba),
 };
 
 /* Scan response: полное имя устройства из CONFIG_BT_DEVICE_NAME. */
@@ -99,16 +108,30 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	default_conn = bt_conn_ref(conn);
 
-	/* Запрашиваем шифрование (задел под канал данных бейджа). */
+	/* Событие в журнал (очередь + system workqueue — безопасно
+	 * из RX-потока HCI). */
+	event_log_write(EV_BLE_CONN, 0);
+
+	/* Запрос шифрования ВЫКЛЮЧЕН (временно). Свежее спаривание с телефоном
+	 * стабильно падает на этапе шифрования после раздачи ключей
+	 * (телефон: "Encryption failed (1)" + удаление бонда; жетон:
+	 * PIN_OR_KEY_MISSING), а GATT-операции вокруг неудачного бондинга
+	 * Android режет. Атрибуты фазы 1 (CCC/BAD6E003) шифрования не
+	 * требуют (PROTOCOL.md). Вернуть после разбора SMP (возможно,
+	 * дело в SC_PAIR_ONLY и legacy-контроллере телефона). */
+	/*
 	if (bt_conn_set_security(conn, BT_SECURITY_L2)) {
 		LOG_WRN("Не удалось задать уровень безопасности");
 	}
+	*/
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_INF("Bluetooth отключён, причина 0x%02x %s",
 		reason, bt_hci_err_to_str(reason));
+
+	event_log_write(EV_BLE_DISC, reason);
 
 	if (default_conn == conn) {
 		bt_conn_unref(default_conn);
@@ -177,6 +200,10 @@ static void bt_ready(int err)
 
 	LOG_INF("Реклама запущена: устройство видно как \"%s\"",
 		CONFIG_BT_DEVICE_NAME);
+
+	/* Стартовые значения стандартных сервисов после готовности
+	 * стека (BAS = 100 % заглушка) — gatt_badge.c. */
+	gatt_badge_bt_ready();
 }
 
 /* ------------------------------------------------------------------ *
